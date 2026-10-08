@@ -1,486 +1,503 @@
-import streamlit as st
+from __future__ import annotations
+
+import sys
+import hmac
+import os
+from html import escape
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import folium
+import streamlit as st
 from streamlit_folium import st_folium
-import os
 
-# ─── Page config ────────────────────────────────────────────────
-st.set_page_config(
-    page_title="AquaShield — VVN Flood Intelligence",
+from src.community.store import add_report, list_reports, seed_synthetic_demo_posts, update_verification
+from src.dashboard.maps import add_flood_grid, add_path, add_reports, add_roads, add_social_videos, base_map
+from src.dashboard.theme import banner, header, inject_theme, risk_chip
+from src.social.loader import load_social_reports
+from src.data_store import (
+    latest_grid_snapshot,
+    load_config,
+    load_flood_dataset,
+    load_known_events,
+    load_metrics,
+    load_road_dataset,
+)
+from src.iot.simulator import load_forecast_with_fallback, simulate_iot_series
+from src.model_training.predict import predict_from_manual
+from src.paths import NAMED_PLACES
+from src.routing.graph import apply_community_penalties, build_route_graph, nearest_node, shortest_path
+
+
+def _plotly_layout(fig):
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#131D26",
+        font=dict(family="Segoe UI, Arial, sans-serif", color="#E6EDF3"),
+        margin=dict(l=20, r=20, t=50, b=20),
+        legend=dict(orientation="h"),
+    )
+    return fig
+
+
+def page_home(flood, events, forecast, forecast_note):
+    header(st, "Rainfall forecast when available, rule-based risk, curated events, and model-ready context.")
+    snap = latest_grid_snapshot(flood)
+    high_n = int((snap.flood_risk == "High").sum())
+    med_n = int((snap.flood_risk == "Medium").sum())
+    mean_rain = float(snap.precipitation_mm.mean())
+    next3 = float(forecast.head(3)["precipitation_mm"].sum()) if len(forecast) else 0
+    peak = forecast.loc[forecast["precipitation_mm"].idxmax()] if len(forecast) else None
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Grid cells (latest historical day)", f"{len(snap)}", help="12 Open-Meteo sample points covering VVN.")
+    c2.metric("Mean rainfall on that day", f"{mean_rain:.1f} mm")
+    c3.metric("High / Medium cells", f"{high_n} / {med_n}")
+    stale_forecast = "stale" in forecast_note.lower()
+    c4.metric("Last 3 cached days rain" if stale_forecast else "Next 3-day forecast rain", f"{next3:.1f} mm")
+
+    if stale_forecast:
+        banner(st, "medium", f"<b>Current forecast unavailable.</b> {escape(forecast_note)}")
+    elif peak is not None and peak["flood_risk_forecast"] == "High":
+        banner(st, "high", f"<b>High-rainfall threshold reached (demo).</b> Forecast peak {peak['precipitation_mm']} mm on {peak['date']}. {escape(forecast_note)}")
+    elif peak is not None and peak["flood_risk_forecast"] == "Medium":
+        banner(st, "medium", f"<b>Rainfall threshold watch (demo).</b> Forecast peak {peak['precipitation_mm']} mm on {peak['date']}. {escape(forecast_note)}")
+    else:
+        banner(st, "low", f"<b>No high-rain forecast in the downloaded window.</b> {escape(forecast_note)}")
+
+    st.markdown("**Data layers on this page are labelled.** Historical grid risk uses a rule-based formula, not surveyed flood extents.")
+    left, right = st.columns((1.2, 1))
+    with left:
+        st.subheader("7-day rainfall history / forecast window")
+        fig = px.bar(forecast, x="date", y="precipitation_mm", color="flood_risk_forecast",
+                     color_discrete_map={"Low": "#1e8449", "Medium": "#d68910", "High": "#c0392b"})
+        st.plotly_chart(_plotly_layout(fig), use_container_width=True)
+    with right:
+        st.subheader("Official / curated historical events")
+        st.caption("Separated from user community reports and from synthetic demo posts.")
+        st.dataframe(events, hide_index=True, use_container_width=True)
+
+    st.subheader("Latest processed grid snapshot")
+    show = snap[["latitude", "longitude", "precipitation_mm", "elevation_m", "drainage_dist_km",
+                 "building_count", "flood_risk", "flood_risk_score"]].sort_values("flood_risk_score", ascending=False)
+    st.dataframe(show, hide_index=True, use_container_width=True)
+
+
+def page_flood_map(flood):
+    header(st, "Interactive map of grid flood-risk scores. Sparse 12-point sample — not a hydraulic inundation map.")
+    min_d = flood["date"].min().date()
+    max_d = flood["date"].max().date()
+    pick = st.date_input("Historical date (processed rainfall grid)", value=max_d, min_value=min_d, max_value=max_d)
+    snap = flood[flood["date"].dt.date == pick]
+    show_videos = st.checkbox("Show public YouTube/Instagram pins (unverified crowd signal)", value=True)
+    m = add_flood_grid(base_map(), snap)
+    if show_videos:
+        add_social_videos(m, load_social_reports())
+    st_folium(m, height=520, use_container_width=True, returned_objects=[])
+    banner(st, "sim", "Labels are rule-based (60% rainfall, 25% elevation, 15% drainage distance). Heat is interpolated between 12 sample locations. Video pins are not official flood proof.")
+
+
+def page_analytics(flood, events):
+    header(st, "Rainfall trends, risk mix, and the 18 July 2021 curated event window.")
+    daily = flood.groupby("date", as_index=False).agg(
+        precipitation_mm=("precipitation_mm", "mean"),
+        flood_risk_score=("flood_risk_score", "mean"),
+    )
+    fig = px.line(daily, x="date", y="precipitation_mm", title="Basin-mean daily rainfall (processed Open-Meteo grid)")
+    for _, ev in events.iterrows():
+        fig.add_vline(x=pd.Timestamp(ev["date"]), line_dash="dot", line_color="#c0392b")
+    st.plotly_chart(_plotly_layout(fig), use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        counts = flood["flood_risk"].value_counts().rename_axis("risk").reset_index(name="rows")
+        fig2 = px.pie(counts, names="risk", values="rows", title="Rule-based label mix (all years)",
+                      color="risk", color_discrete_map={"Low": "#1e8449", "Medium": "#d68910", "High": "#c0392b"})
+        st.plotly_chart(_plotly_layout(fig2), use_container_width=True)
+    with col2:
+        flood = flood.copy()
+        flood["month"] = flood["date"].dt.month
+        mon = flood.groupby("month")["precipitation_mm"].mean().reset_index()
+        fig3 = px.bar(mon, x="month", y="precipitation_mm", title="Mean rainfall by month")
+        st.plotly_chart(_plotly_layout(fig3), use_container_width=True)
+
+    st.markdown("High-risk rows are rare (~1.4% in the processed file). That is why model training reports Macro-F1 and High-risk recall instead of accuracy.")
+
+
+def page_ml(flood):
+    header(st, "Flood-risk model: genuine hold-out metrics, what-if inference, and proxy-label caveats.")
+    metrics = load_metrics()
+    if metrics is None:
+        st.error("Models are not trained yet. From the project root run: `python src/model_training/train_flood_risk_model.py`")
+        return
+    st.warning(
+        "Near-perfect temporal accuracy is **not** a claim of operational skill. "
+        "The target labels are generated from rainfall, elevation and drainage — the same family of inputs. "
+        "The spatial hold-out (~0.91 Macro-F1) is the more honest check. These scores were measured, not hardcoded."
+    )
+
+    st.subheader("Temporal split (train 2019–2022 / test 2023)")
+    rows = []
+    for name, m in metrics["temporal_split"]["models"].items():
+        rows.append({
+            "model": name,
+            "accuracy": round(m["accuracy"], 3),
+            "macro_f1": round(m["macro_f1"], 3),
+            "high_risk_recall": round(m["high_risk_recall"], 3),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.write(f"Selected classifier: **{metrics['best_classifier']}** (Macro-F1 and High-risk recall, not accuracy).")
+    st.write(f"Selected regressor: **{metrics['best_regressor']}** · temporal RMSE shown below.")
+    st.json(metrics.get("regression_temporal", {}))
+
+    st.subheader("Spatial split (held-out grid locations)")
+    sm = metrics["spatial_split"]["metrics"]
+    st.write(
+        f"Macro-F1 {sm['macro_f1']:.3f} · High-risk recall {sm['high_risk_recall']:.3f} · "
+        f"Accuracy {sm['accuracy']:.3f} (accuracy is not the headline metric)."
+    )
+    with st.expander("Classification report (spatial hold-out)"):
+        st.text(sm.get("classification_report", ""))
+
+    st.subheader("What-if prediction")
+    c1, c2, c3, c4 = st.columns(4)
+    rain = c1.slider("Precipitation (mm)", 0.0, 250.0, 45.0)
+    elev = c2.slider("Elevation (m)", 0.0, 80.0, 8.0)
+    drain = c3.slider("Distance to drainage (km)", 0.0, 5.0, 0.8)
+    bld = c4.slider("Building count (proxy)", 0, 400, 80)
+    monsoon = st.checkbox("Monsoon season flag", value=datetime.now().month in (6, 7, 8, 9))
+    if st.button("Run model"):
+        result = predict_from_manual(
+            precipitation_mm=rain,
+            elevation_m=elev,
+            building_count=bld,
+            drainage_dist_km=drain,
+            is_monsoon=int(monsoon),
+        )
+        if "error" in result:
+            st.error(result["error"])
+        else:
+            st.markdown(
+                f"Predicted class {risk_chip(result['label'])} · vulnerability score "
+                f"**{result['vulnerability_score']:.1f}** · model `{result['model_name']}`",
+                unsafe_allow_html=True,
+            )
+            if result.get("probabilities"):
+                st.write(result["probabilities"])
+
+
+def page_roads(roads):
+    header(st, "Road-segment infrastructure risk from elevation and drainage proximity (OSM-derived).")
+    mix = roads["infra_risk"].value_counts()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Segments", f"{len(roads):,}")
+    c2.metric("High infra-risk", int(mix.get("High", 0)))
+    c3.metric("Medium infra-risk", int(mix.get("Medium", 0)))
+    m = add_roads(base_map(12), roads)
+    st_folium(m, height=540, use_container_width=True, returned_objects=[])
+    st.caption("Sampled markers for speed. Scores are static infrastructure susceptibility, not live water depth.")
+
+
+def page_routes(roads):
+    header(st, "Risk-weighted Dijkstra on the road-midpoint graph, plus a geographic-distance alternative.")
+    st.caption("Demo approximation: nearby road-segment midpoints are connected by straight-line links; this is not a verified street-by-street or turn-by-turn route. Check actual road conditions before travelling.")
+    banner(
+        st,
+        "sim",
+        "Unverified community reports never prove a road is flooded. Only <b>Verified</b> reports younger than 48 hours "
+        "add a local penalty. Infrastructure risk still comes from the processed road table.",
+    )
+    places = list(NAMED_PLACES.keys())
+    c1, c2 = st.columns(2)
+    origin_name = c1.selectbox("Origin", places, index=0)
+    dest_name = c2.selectbox("Destination", places, index=4)
+    use_community = st.checkbox("Apply verified recent community penalties", value=True)
+    if origin_name == dest_name:
+        st.warning("Choose two different places.")
+        return
+
+    @st.cache_resource
+    def _graph():
+        return build_route_graph()
+
+    G = _graph()
+    reports = list_reports()
+    if use_community:
+        G_use = apply_community_penalties(G, reports)
+    else:
+        G_use = G
+    o = NAMED_PLACES[origin_name]
+    d = NAMED_PLACES[dest_name]
+    s = nearest_node(G_use, o[0], o[1])
+    e = nearest_node(G_use, d[0], d[1])
+    try:
+        risk_path = shortest_path(G_use, s, e, weight="risk_weight")
+        geo_path = shortest_path(G_use, s, e, weight="dist_km")
+    except Exception as exc:
+        st.error(f"No path in the connected road graph: {exc}")
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Risk-aware distance", f"{risk_path['distance_km']:.2f} km")
+    m2.metric("Geographic-shortest distance", f"{geo_path['distance_km']:.2f} km")
+    m3.metric("High-infra edges on risk path", int(risk_path["high_risk_edges"]))
+
+    m = base_map(12)
+    add_path(m, geo_path["coords"], "#7f8c8d", "Geographic shortest", weight=4)
+    add_path(m, risk_path["coords"], "#0b6e6a", "Risk-weighted", weight=7)
+    add_reports(m, [r for r in reports if r.get("latitude") is not None])
+    st_folium(m, height=540, use_container_width=True, returned_objects=[])
+    st.caption("Teal = risk-weighted route. Grey = shortest geographic distance on the same graph.")
+
+
+def page_iot():
+    header(st, "Canal-side telemetry placeholder until ESP32 + Firebase nodes are installed.")
+    banner(st, "sim", "<b>SIMULATION</b> — water level, rain rate, soil moisture and temperature are generated from a time-seeded model. No hardware is connected.")
+    hours = st.slider("Hours of simulated history", 12, 72, 48)
+    df = simulate_iot_series(hours=hours)
+    warn_cm, alert_cm = 80, 120
+    latest = df.iloc[-1]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Water level", f"{latest.water_level_cm:.0f} cm")
+    c2.metric("Rain rate", f"{latest.rain_rate_mm_hr:.1f} mm/h")
+    c3.metric("Soil moisture", f"{latest.soil_moisture_pct:.0f} %")
+    c4.metric("Temperature", f"{latest.temperature_c:.1f} °C")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.timestamp, y=df.water_level_cm, name="Water level (cm)", line=dict(color="#1c4e7a", width=2)))
+    fig.add_hline(y=warn_cm, line_dash="dash", line_color="#d68910", annotation_text="Warning 80 cm")
+    fig.add_hline(y=alert_cm, line_dash="dash", line_color="#c0392b", annotation_text="Alert 120 cm")
+    st.plotly_chart(_plotly_layout(fig), use_container_width=True)
+    fig2 = px.line(df, x="timestamp", y=["rain_rate_mm_hr", "soil_moisture_pct"], title="Rain rate and soil moisture (simulated)")
+    st.plotly_chart(_plotly_layout(fig2), use_container_width=True)
+    st.dataframe(df.tail(12), hide_index=True, use_container_width=True)
+
+
+def page_social():
+    header(st, "Public YouTube Shorts and manually catalogued Instagram posts. Separate from official alerts and citizen uploads.")
+    banner(
+        st,
+        "sim",
+        "These clips are <b>crowd / news media</b>, not sensor readings. Location and severity were inferred from titles "
+        "and then jittered so pins are not stacked on one dummy coordinate. An unverified video does not prove a road is flooded.",
+    )
+    reports = load_social_reports()
+    if not reports:
+        st.error("Social report JSON is missing. Run `python src/social/enrich_reports.py` from the project folder.")
+        return
+
+    df = pd.DataFrame(reports)
+    c1, c2, c3, c4 = st.columns(4)
+    only_relevant = c1.checkbox("VVN-relevant only", value=True)
+    plat = c2.multiselect("Platform", sorted(df["platform"].dropna().unique()), default=list(df["platform"].dropna().unique()))
+    sev = c3.multiselect("Severity", ["low", "medium", "high"], default=["low", "medium", "high"])
+    loc_options = ["All"] + sorted(df["location"].dropna().unique().tolist())
+    loc = c4.selectbox("Locality", loc_options)
+
+    view = df.copy()
+    if only_relevant and "relevant" in view.columns:
+        view = view[view["relevant"] != False]
+    view = view[view["platform"].isin(plat) & view["severity"].isin(sev)]
+    if loc != "All":
+        view = view[view["location"] == loc]
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Videos shown", len(view))
+    k2.metric("YouTube", int((view["platform"] == "youtube").sum()))
+    k3.metric("Instagram (manual catalog)", int((view["platform"] == "instagram").sum()))
+
+    m = add_social_videos(base_map(12), view.to_dict("records"))
+    st_folium(m, height=460, use_container_width=True, returned_objects=[])
+
+    st.subheader("Watch a clip")
+    if view.empty:
+        st.info("No videos match these filters.")
+        return
+    labels = [f"{r['location']} · {r['severity']} · {str(r.get('title') or '')[:70]}" for _, r in view.iterrows()]
+    choice = st.selectbox("Pick a video", range(len(labels)), format_func=lambda i: labels[i])
+    row = view.iloc[int(choice)]
+    st.write(str(row["title"]))
+    st.caption(
+        f"{escape(str(row['platform']))} · {escape(str(row['location']))} · severity {escape(str(row['severity']))} · "
+        f"{escape(str(row.get('published_at') or '')[:10])} · {escape(str(row.get('geo_note', '')))}"
+    )
+    import streamlit.components.v1 as components
+
+    embed = str(row.get("embed_url") or "")
+    if row["platform"] == "youtube" and embed:
+        components.iframe(embed, height=420)
+    elif row["platform"] == "instagram" and embed:
+        components.iframe(embed, height=640)
+    else:
+        st.info("Instagram has no public search API. This row is a manual hashtag catalog card (no embed).")
+    if row.get("source_url"):
+        st.link_button("Open original / hashtag page", row["source_url"])
+
+
+def page_community():
+    header(st, "Citizen photo/video reports. Kept separate from official alerts and from synthetic demo posts.")
+    st.caption("Do not submit private or sensitive information. Reports are unverified by default; hosted demo storage may reset.")
+    seed_synthetic_demo_posts()
+    banner(
+        st,
+        "medium",
+        "An <b>unverified</b> report is a crowd signal only. It does not prove a road is flooded and is not used as a hard barrier in routing.",
+    )
+    with st.form("report_form", clear_on_submit=True):
+        caption = st.text_area("Caption")
+        place = st.selectbox("Optional named location", ["(none)"] + list(NAMED_PLACES.keys()))
+        custom = st.text_input("Or location label (optional)")
+        col_a, col_b = st.columns(2)
+        lat = col_a.number_input("Latitude (optional, 0 = skip)", value=0.0, format="%.6f")
+        lon = col_b.number_input("Longitude (optional, 0 = skip)", value=0.0, format="%.6f")
+        media = st.file_uploader("Photo or video", type=["jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "webm"])
+        submitted = st.form_submit_button("Submit report")
+        if submitted:
+            if not caption.strip():
+                st.error("Caption is required.")
+            elif bool(lat) != bool(lon):
+                st.error("Enter both latitude and longitude, or leave both as 0.")
+            elif lat and not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                st.error("Coordinates must be valid latitude (−90 to 90) and longitude (−180 to 180).")
+            else:
+                chosen_lat = lat if lat else None
+                chosen_lon = lon if lon else None
+                label = None if place == "(none)" else place
+                if label and (not chosen_lat):
+                    chosen_lat, chosen_lon = NAMED_PLACES[label]
+                if custom:
+                    label = custom
+                add_report(
+                    caption=caption,
+                    latitude=chosen_lat,
+                    longitude=chosen_lon,
+                    location_label=label,
+                    media_bytes=media.getvalue() if media else None,
+                    filename=media.name if media else None,
+                    source_layer="user_report",
+                    verification_status="Unverified",
+                )
+                st.success("Saved as an unverified user report.")
+
+    reports = list_reports()
+    user_n = sum(1 for r in reports if r["source_layer"] == "user_report")
+    syn_n = sum(1 for r in reports if r["source_layer"] == "synthetic_demo")
+    st.write(f"User reports: **{user_n}** · Synthetic demo posts: **{syn_n}** · Official events live on Home, not here.")
+
+    m = add_reports(base_map(12), reports)
+    st_folium(m, height=420, use_container_width=True, returned_objects=[])
+    show_moderation = False
+    if show_moderation:
+        st.subheader("Moderation (demonstration)")
+        try:
+            moderator_password = st.secrets.get("moderator_password", os.environ.get("AQUASHIELD_MODERATOR_PASSWORD", ""))
+        except Exception:
+            moderator_password = os.environ.get("AQUASHIELD_MODERATOR_PASSWORD", "")
+        can_moderate = False
+        if moderator_password:
+            entered_password = st.text_input("Moderator password", type="password", key="moderator_password")
+            can_moderate = hmac.compare_digest(entered_password, str(moderator_password)) if entered_password else False
+            if not can_moderate:
+                st.caption("Verification controls unlock only with the moderator password.")
+        else:
+            st.info("Moderation controls are locked. Set `moderator_password` in Streamlit Cloud → App settings → Secrets to enable them.")
+        for rep in reports:
+            cols = st.columns((3, 1, 1, 1)) if can_moderate else [st.container()]
+            cols[0].write(rep["caption"])
+            layer_cls = "chip-user" if rep["source_layer"] == "user_report" else "chip-synthetic"
+            status_cls = "chip-verified" if rep["verification_status"] == "Verified" else "chip-unverified"
+            cols[0].markdown(
+                f"<span class='as-chip {layer_cls}'>{escape(str(rep['source_layer']))}</span>"
+                f"<span class='as-chip {status_cls}'>{escape(str(rep['verification_status']))}</span><br>"
+                f"<span class='as-footnote'>{escape(str(rep['created_at'])[:19])} UTC"
+                f"{' · ' + escape(str(rep['location_label'])) if rep.get('location_label') else ''}</span>",
+                unsafe_allow_html=True,
+            )
+            if rep.get("media_path") and rep.get("media_kind") == "image":
+                cols[0].image(rep["media_path"], width=280)
+            elif rep.get("media_kind") == "video" and rep.get("media_path"):
+                cols[0].video(rep["media_path"])
+            if can_moderate:
+                if cols[1].button("Verify", key=f"v{rep['id']}"):
+                    update_verification(rep["id"], "Verified")
+                    st.rerun()
+                if cols[2].button("Reject", key=f"r{rep['id']}"):
+                    update_verification(rep["id"], "Rejected")
+                    st.rerun()
+                if cols[3].button("Unverify", key=f"u{rep['id']}"):
+                    update_verification(rep["id"], "Unverified")
+                    st.rerun()
+
+
+def main():
+    st.set_page_config(
+    page_title="AquaShield",
     page_icon="🌊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
-
-# ─── Custom CSS ─────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #1a6eb5;
-        margin-bottom: 0.2rem;
-    }
-    .sub-header {
-        font-size: 0.95rem;
-        color: #888;
-        margin-bottom: 1.5rem;
-    }
-    .metric-card {
-        background: #f0f4f9;
-        border-radius: 12px;
-        padding: 1rem 1.2rem;
-        border-left: 4px solid #1a6eb5;
-    }
-    .risk-high   { color: #c0392b; font-weight: 700; }
-    .risk-medium { color: #e67e22; font-weight: 700; }
-    .risk-low    { color: #27ae60; font-weight: 700; }
-    div[data-testid="stSidebar"] { background-color: #0d1b2a; }
-    div[data-testid="stSidebar"] * { color: #e0e8f0 !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ─── Data loading ────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE, "..", "..", "data", "processed")
-
-@st.cache_data
-def load_flood():
-    path = os.path.join(DATA_DIR, "flood_risk_dataset.csv")
-    df = pd.read_csv(path)
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df["year"]  = df["date"].dt.year
-        df["month"] = df["date"].dt.month
-    return df
-
-@st.cache_data
-def load_roads():
-    path = os.path.join(DATA_DIR, "road_risk_dataset.csv")
-    df = pd.read_csv(path)
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-    return df
-
-# Detect risk column name (handles slight naming differences)
-def get_risk_col(df):
-    for column in ["flood_risk", "infra_risk"]:
-        if column in df.columns:
-            return column
-
-    for column in df.columns:
-        if "risk" in column and "score" not in column:
-            return column
-
-    return None
-
-def get_score_col(df):
-    for c in df.columns:
-        if "score" in c:
-            return c
-    return None
-
-try:
-    flood_df = load_flood()
-    roads_df = load_roads()
-    data_ok = True
-except Exception as e:
-    data_ok = False
-    err_msg = str(e)
-
-# ─── Sidebar nav ────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🌊 AquaShield")
-    st.markdown("**Urban Flood Intelligence**")
-    st.markdown("*Vasai-Virar-Nalasopara*")
-    st.markdown("---")
-    page = st.radio(
-        "Navigate",
-        ["🏠 Home", "🗺️ Flood Risk Map", "📊 Analytics", "🛣️ Road Risk Map",
-         "🛡️ Safe Routes", "📡 IoT Sensor"],
-        label_visibility="collapsed"
+    inject_theme(st)
+    st.markdown(
+        '<div class="as-appbar"><span class="as-app-badge">AquaShield application</span>'
+        "<span class='as-footnote'>Vasai–Virar–Nalasopara flood intelligence</span></div>",
+        unsafe_allow_html=True,
     )
-    st.markdown("---")
-    st.markdown("**Team AquaShield**")
-    st.caption("Harshita • Mufis • Vidhan • Dhana")
+    config = load_config()
 
-if not data_ok:
-    st.error(f"❌ Data load karne mein error: {err_msg}")
-    st.info("Check karo ki `data/processed/` folder mein dono CSV files hain.")
-    st.stop()
+    @st.cache_data(ttl=600)
+    def _forecast(low, medium):
+        return load_forecast_with_fallback({"low": low, "medium": medium, "high": medium})
 
-# ════════════════════════════════════════════════════════════════
-# PAGE 1 — HOME
-# ════════════════════════════════════════════════════════════════
-if page == "🏠 Home":
-    st.markdown('<p class="main-header">🌊 AquaShield</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Urban Flood Intelligence System — Vasai-Virar-Nalasopara, Maharashtra</p>',
-                unsafe_allow_html=True)
+    flood = load_flood_dataset()
+    roads = load_road_dataset()
+    events = load_known_events()
+    th = config["flood_risk_thresholds"]
+    forecast, forecast_note = _forecast(th["low"], th["medium"])
 
-    risk_col = get_risk_col(flood_df)
-    score_col = get_score_col(flood_df)
+    st.sidebar.markdown("### AquaShield")
+    st.sidebar.caption("VVN flood intelligence")
+    page = st.sidebar.radio(
+        "Navigate",
+        [
+            "Home Dashboard",
+            "Flood Risk Map",
+            "Analytics",
+            "ML Model",
+            "Road Risk Map",
+            "Safe Routes",
+            "IoT Sensor Monitoring",
+            "Community Reports",
+            "Social Videos (YT / IG)",
+        ],
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Observations, synthetic IoT, demo posts, and user uploads are stored in separate layers.")
 
-    # Summary metrics
-    c1, c2, c3, c4 = st.columns(4)
-    total = len(flood_df)
-    if risk_col:
-        high   = (flood_df[risk_col].str.lower() == "high").sum()
-        medium = (flood_df[risk_col].str.lower() == "medium").sum()
-        low    = (flood_df[risk_col].str.lower() == "low").sum()
+    if page == "Home Dashboard":
+        page_home(flood, events, forecast, forecast_note)
+    elif page == "Flood Risk Map":
+        page_flood_map(flood)
+    elif page == "Analytics":
+        page_analytics(flood, events)
+    elif page == "ML Model":
+        page_ml(flood)
+    elif page == "Road Risk Map":
+        page_roads(roads)
+    elif page == "Safe Routes":
+        page_routes(roads)
+    elif page == "IoT Sensor Monitoring":
+        page_iot()
+    elif page == "Community Reports":
+        page_community()
     else:
-        high = medium = low = 0
-
-    c1.metric("📍 Total records", f"{total:,}", "12 locations × 5 yrs")
-    c2.metric("🔴 High-risk days", f"{high:,}", f"{high/total*100:.1f}% of total", delta_color="inverse")
-    c3.metric("🟡 Medium-risk days", f"{medium:,}", f"{medium/total*100:.1f}%")
-    c4.metric("🟢 Low-risk days", f"{low:,}", f"{low/total*100:.1f}%")
-
-    st.markdown("---")
-
-    col_a, col_b = st.columns([1.2, 1])
-
-    with col_a:
-        st.subheader("📅 Risk distribution over time")
-        if risk_col and "year" in flood_df.columns:
-            yearly = flood_df.groupby(["year", risk_col]).size().reset_index(name="count")
-            fig = px.bar(yearly, x="year", y="count", color=risk_col,
-                         color_discrete_map={"Low": "#27ae60", "Medium": "#e67e22", "High": "#c0392b"},
-                         barmode="stack", height=320)
-            fig.update_layout(margin=dict(l=0, r=0, t=30, b=0), legend_title="Risk level")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Date/risk column nahi mila CSV mein.")
-
-    with col_b:
-        st.subheader("⚠️ About VVN")
-        st.info("""
-**Vasai-Virar-Nalasopara** is one of the most flood-prone
-urban regions near Mumbai.
-
-- Area: ~310–380 sq. km
-- Floods almost every monsoon
-- Verified flood event: **18 July 2021**
-- Low elevation + blocked drainage + rapid construction
-        """)
-        st.subheader("📋 Project phases")
-        st.success("✅ Phase 0-1-2: Data collection & preprocessing")
-        st.warning("🔄 Phase 3: ML model training (Mufis)")
-        st.warning("🔄 Phase 4: Route engine (Vidhan)")
-        st.info("🚧 Phase 5: Dashboard (Dhana — this!)")
-        st.info("⏳ Phase 6: IoT sensor integration")
-
-    st.markdown("---")
-    st.subheader("🗂️ Raw data preview")
-    tab1, tab2 = st.tabs(["Flood risk dataset", "Road risk dataset"])
-    with tab1:
-        st.dataframe(flood_df.head(20), use_container_width=True)
-        st.caption(f"Total rows: {len(flood_df):,} | Columns: {list(flood_df.columns)}")
-    with tab2:
-        st.dataframe(roads_df.head(20), use_container_width=True)
-        st.caption(f"Total rows: {len(roads_df):,} | Columns: {list(roads_df.columns)}")
+        page_social()
 
 
-# ════════════════════════════════════════════════════════════════
-# PAGE 2 — FLOOD RISK MAP
-# ════════════════════════════════════════════════════════════════
-elif page == "🗺️ Flood Risk Map":
-    st.markdown('<p class="main-header">🗺️ Flood Risk Map</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Location-wise flood risk across Vasai-Virar-Nalasopara</p>',
-                unsafe_allow_html=True)
-
-    risk_col  = get_risk_col(flood_df)
-    score_col = get_score_col(flood_df)
-
-    # Find lat/lon columns
-    lat_col = next((c for c in flood_df.columns if "lat" in c), None)
-    lon_col = next((c for c in flood_df.columns if "lon" in c or "lng" in c), None)
-
-    col_filter, col_info = st.columns([1, 3])
-    with col_filter:
-        if "year" in flood_df.columns:
-            years = sorted(flood_df["year"].dropna().unique().astype(int).tolist())
-            sel_year = st.selectbox("Select year", years, index=len(years)-1)
-            filtered = flood_df[flood_df["year"] == sel_year]
-        else:
-            filtered = flood_df
-            st.info("No date column found.")
-
-        if risk_col:
-            levels = ["All"] + sorted(flood_df[risk_col].dropna().unique().tolist())
-            sel_risk = st.selectbox("Filter by risk", levels)
-            if sel_risk != "All":
-                filtered = filtered[filtered[risk_col].str.lower() == sel_risk.lower()]
-
-        st.metric("Showing records", f"{len(filtered):,}")
-
-    with col_info:
-        st.markdown("""
-        **Color coding:**
-        🟢 **Green** = Low risk &nbsp;&nbsp; 🟡 **Orange** = Medium risk &nbsp;&nbsp; 🔴 **Red** = High risk
-
-        Each dot = one monitoring location on one day. Click any dot for details.
-        """)
-
-    # Map
-    if lat_col and lon_col:
-        map_data = filtered[[lat_col, lon_col, risk_col, score_col]].dropna().copy() if (risk_col and score_col) else filtered[[lat_col, lon_col]].dropna().copy()
-
-        # Sample for performance (max 2000 points)
-        if len(map_data) > 2000:
-            map_data = map_data.sample(2000, random_state=42)
-
-        m = folium.Map(location=[19.45, 72.82], zoom_start=12,
-                       tiles="CartoDB positron")
-
-        color_map = {"low": "green", "medium": "orange", "high": "red"}
-
-        for _, row in map_data.iterrows():
-            try:
-                risk_val = str(row[risk_col]).lower() if risk_col else "low"
-                color    = color_map.get(risk_val, "blue")
-                score_val = f"Score: {row[score_col]:.1f}" if score_col and pd.notna(row[score_col]) else ""
-                folium.CircleMarker(
-                    location=[row[lat_col], row[lon_col]],
-                    radius=6,
-                    color=color,
-                    fill=True,
-                    fill_color=color,
-                    fill_opacity=0.7,
-                    popup=folium.Popup(
-                        f"<b>Risk: {risk_val.title()}</b><br>{score_val}<br>"
-                        f"Lat: {row[lat_col]:.4f}, Lon: {row[lon_col]:.4f}",
-                        max_width=200
-                    )
-                ).add_to(m)
-            except Exception:
-                continue
-
-        st_folium(m, width=None, height=520, returned_objects=[])
-    else:
-        st.warning("CSV mein latitude/longitude columns nahi mile. Column names check karo.")
-        st.write("Available columns:", list(flood_df.columns))
-
-
-# ════════════════════════════════════════════════════════════════
-# PAGE 3 — ANALYTICS
-# ════════════════════════════════════════════════════════════════
-elif page == "📊 Analytics":
-    st.markdown('<p class="main-header">📊 Analytics</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Historical flood data analysis — VVN 2019–2023</p>',
-                unsafe_allow_html=True)
-
-    risk_col  = get_risk_col(flood_df)
-    score_col = get_score_col(flood_df)
-
-    # KPI row
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total data points", f"{len(flood_df):,}", "12 locations × 5 years daily")
-    if risk_col:
-        high = (flood_df[risk_col].str.lower() == "high").sum()
-        c2.metric("High-risk records", f"{high:,}", f"{high/len(flood_df)*100:.1f}% of all data",
-                  delta_color="inverse")
-    road_risk_col = get_risk_col(roads_df)
-    if road_risk_col:
-        road_high = (roads_df[road_risk_col].str.lower() == "high").sum()
-        c3.metric("High-risk roads", f"{road_high:,}",
-                  f"{road_high/len(roads_df)*100:.0f}% of {len(roads_df):,} roads",
-                  delta_color="inverse")
-
-    st.markdown("---")
-    tab1, tab2, tab3, tab4 = st.tabs(["📅 Monthly rainfall", "🎯 Risk distribution",
-                                       "📈 Year trend", "🏘️ Area hotspots"])
-
-    # Tab 1: Monthly rainfall
-    with tab1:
-        rain_col = next((c for c in flood_df.columns if "rain" in c), None)
-        if rain_col and "month" in flood_df.columns:
-            monthly = flood_df.groupby("month")[rain_col].mean().reset_index()
-            month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
-                           7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
-            monthly["month_name"] = monthly["month"].map(month_names)
-            monthly["is_monsoon"] = monthly["month"].isin([6,7,8,9])
-            fig = px.bar(monthly, x="month_name", y=rain_col,
-                         color="is_monsoon",
-                         color_discrete_map={True: "#1a6eb5", False: "#b0c4de"},
-                         labels={rain_col: "Avg rainfall (mm)", "month_name": "Month"},
-                         title="Average monthly rainfall — VVN (2019–2023)",
-                         height=380)
-            fig.update_layout(showlegend=False, margin=dict(l=0, r=0, t=40, b=0))
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Blue bars = monsoon months (Jun–Sep). July is consistently the highest-risk month.")
-        else:
-            st.info("Rainfall ya month column nahi mila CSV mein.")
-
-    # Tab 2: Risk distribution
-    with tab2:
-        if risk_col:
-            col_pie, col_bar = st.columns(2)
-            with col_pie:
-                counts = flood_df[risk_col].value_counts().reset_index()
-                counts.columns = ["Risk level", "Count"]
-                fig = px.pie(counts, names="Risk level", values="Count",
-                             color="Risk level",
-                             color_discrete_map={"Low":"#27ae60","Medium":"#e67e22","High":"#c0392b"},
-                             title="Flood risk zone distribution",
-                             hole=0.4, height=340)
-                fig.update_layout(margin=dict(l=0,r=0,t=40,b=0))
-                st.plotly_chart(fig, use_container_width=True)
-            with col_bar:
-                if road_risk_col:
-                    road_counts = roads_df[road_risk_col].value_counts().reset_index()
-                    road_counts.columns = ["Risk level", "Count"]
-                    fig2 = px.bar(road_counts, x="Risk level", y="Count",
-                                  color="Risk level",
-                                  color_discrete_map={"Low":"#27ae60","Medium":"#e67e22","High":"#c0392b"},
-                                  title="Road infrastructure risk",
-                                  height=340)
-                    fig2.update_layout(showlegend=False, margin=dict(l=0,r=0,t=40,b=0))
-                    st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Risk label column nahi mila.")
-
-    # Tab 3: Year trend
-    with tab3:
-        if risk_col and "year" in flood_df.columns:
-            trend = flood_df[flood_df[risk_col].str.lower() == "high"].groupby("year").size().reset_index(name="high_risk_days")
-            fig = px.line(trend, x="year", y="high_risk_days",
-                          markers=True,
-                          labels={"high_risk_days": "High-risk day count", "year": "Year"},
-                          title="High-risk days per year (2019–2023)",
-                          height=360)
-            fig.add_vline(x=2021, line_dash="dash", line_color="red",
-                          annotation_text="18 Jul 2021 flood", annotation_position="top right")
-            fig.update_traces(line_color="#1a6eb5", marker_size=10)
-            fig.update_layout(margin=dict(l=0,r=0,t=40,b=0))
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("2021 ka spike real flood event ke saath match karta hai — model validation!")
-        else:
-            st.info("Year ya risk column nahi mila.")
-
-    # Tab 4: Area hotspots
-    with tab4:
-        lat_col = next((c for c in flood_df.columns if "lat" in c), None)
-        lon_col = next((c for c in flood_df.columns if "lon" in c or "lng" in c), None)
-        if score_col and lat_col and lon_col:
-            hotspots = (flood_df.groupby([lat_col, lon_col])[score_col]
-                        .mean()
-                        .reset_index()
-                        .sort_values(score_col, ascending=False)
-                        .head(12))
-            hotspots.columns = ["Latitude", "Longitude", "Avg risk score"]
-            hotspots["Avg risk score"] = hotspots["Avg risk score"].round(1)
-            hotspots["Risk level"] = hotspots["Avg risk score"].apply(
-                lambda x: "🔴 High" if x >= 60 else ("🟡 Medium" if x >= 30 else "🟢 Low"))
-            hotspots.insert(0, "Rank", range(1, len(hotspots)+1))
-            st.dataframe(hotspots, use_container_width=True, hide_index=True)
-            st.caption("Locations ranked by average flood risk score (0–100). Higher = more dangerous.")
-        else:
-            st.info("Score ya lat/lon columns nahi mile.")
-
-
-# ════════════════════════════════════════════════════════════════
-# PAGE 4 — ROAD RISK MAP
-# ════════════════════════════════════════════════════════════════
-elif page == "🛣️ Road Risk Map":
-    st.markdown('<p class="main-header">🛣️ Road Risk Map</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Infrastructure risk — which roads flood first</p>',
-                unsafe_allow_html=True)
-
-    road_risk_col = get_risk_col(roads_df)
-    lat_col = next((c for c in roads_df.columns if "lat" in c), None)
-    lon_col = next((c for c in roads_df.columns if "lon" in c or "lng" in c), None)
-
-    col_f, col_i = st.columns([1, 3])
-    with col_f:
-        if road_risk_col:
-            levels = ["All"] + sorted(roads_df[road_risk_col].dropna().unique().tolist())
-            sel = st.selectbox("Filter roads by risk", levels)
-            road_filtered = roads_df if sel == "All" else roads_df[roads_df[road_risk_col].str.lower() == sel.lower()]
-        else:
-            road_filtered = roads_df
-        st.metric("Roads shown", f"{len(road_filtered):,}")
-
-    with col_i:
-        st.markdown("🟢 Low-risk roads = safe to use &nbsp;&nbsp; 🟡 Medium = caution &nbsp;&nbsp; 🔴 High = avoid during floods")
-
-    if lat_col and lon_col:
-        sample = road_filtered.sample(min(2000, len(road_filtered)), random_state=42)
-        m = folium.Map(location=[19.45, 72.82], zoom_start=12, tiles="CartoDB positron")
-        color_map = {"low": "green", "medium": "orange", "high": "red"}
-        for _, row in sample.iterrows():
-            try:
-                risk_val = str(row[road_risk_col]).lower() if road_risk_col else "low"
-                color    = color_map.get(risk_val, "blue")
-                folium.CircleMarker(
-                    location=[row[lat_col], row[lon_col]],
-                    radius=4,
-                    color=color,
-                    fill=True,
-                    fill_color=color,
-                    fill_opacity=0.6,
-                    popup=f"Road risk: {risk_val.title()}"
-                ).add_to(m)
-            except Exception:
-                continue
-        st_folium(m, width=None, height=500, returned_objects=[])
-    else:
-        st.warning("Latitude/longitude columns roads dataset mein nahi mile.")
-        st.write("Available columns:", list(roads_df.columns))
-
-
-# ════════════════════════════════════════════════════════════════
-# PAGE 5 — SAFE ROUTES (Placeholder)
-# ════════════════════════════════════════════════════════════════
-elif page == "🛡️ Safe Routes":
-    st.markdown('<p class="main-header">🛡️ Safe Route Finder</p>', unsafe_allow_html=True)
-    st.info("🔄 **Coming soon** — Vidhan ka routing engine integrate karna hai (Phase 4). "
-            "NetworkX + Dijkstra/A* algorithm use hoga jo high-risk roads avoid karega.")
-    st.markdown("""
-    **Yeh feature kya karega:**
-    - User start point aur end point enter karega
-    - System automatically safest route calculate karega
-    - Flooded / high-risk roads automatically avoid honge
-    - Map pe blue line mein safe route dikhega
-    """)
-    m = folium.Map(location=[19.45, 72.82], zoom_start=12, tiles="CartoDB positron")
-    folium.Marker([19.45, 72.82], popup="Start point (example)", icon=folium.Icon(color="green")).add_to(m)
-    folium.Marker([19.50, 72.85], popup="End point (example)",   icon=folium.Icon(color="red")).add_to(m)
-    st_folium(m, width=None, height=400, returned_objects=[])
-
-
-# ════════════════════════════════════════════════════════════════
-# PAGE 6 — IoT SENSOR (Placeholder)
-# ════════════════════════════════════════════════════════════════
-elif page == "📡 IoT Sensor":
-    st.markdown('<p class="main-header">📡 Live IoT Sensor</p>', unsafe_allow_html=True)
-    st.info("🔄 **Coming soon** — ESP32/Arduino sensor + Firebase integration (Phase 6).")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Water level (demo)", "42 cm", "+3 cm", delta_color="inverse")
-    c2.metric("Buzzer status (demo)", "SAFE", "Below threshold")
-    c3.metric("Last updated (demo)", "2:30 PM", "Live feed paused")
-    st.markdown("""
-    **Yeh feature kya karega:**
-    - ESP32 sensor se real-time water level data aayega
-    - Firebase se live data dashboard mein stream hoga
-    - Threshold cross hone pe buzzer + dashboard alert
-    - Last 1 ghante ka water level graph
-    """)
-    import plotly.graph_objects as go
-    import random
-    demo_y = [30, 32, 35, 38, 40, 42, 41, 43, 42, 40, 39, 38]
-    demo_x = list(range(len(demo_y)))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=demo_x, y=demo_y, mode="lines+markers",
-                             line=dict(color="#1a6eb5", width=2),
-                             name="Water level (cm)"))
-    fig.add_hline(y=50, line_dash="dash", line_color="red",
-                  annotation_text="Alert threshold (50 cm)")
-    fig.update_layout(title="Demo: water level over time",
-                      xaxis_title="Time (minutes ago)",
-                      yaxis_title="Water level (cm)",
-                      height=320, margin=dict(l=0,r=0,t=40,b=0))
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("Above is demo data. Real sensor data will appear here after Phase 6 integration.")
-
+if __name__ == "__main__":
+    main()

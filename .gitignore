@@ -1,6 +1,11 @@
-data/raw/*
-
 venv/
+.venv/
 __pycache__/
 *.pyc
-.DS_Store
+.streamlit/secrets.toml
+data/community/uploads/*
+!data/community/uploads/.gitkeep
+data/community/reports.sqlite*
+.cache/
+tmp/
+output/share/*.zip

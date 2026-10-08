@@ -1,83 +1,65 @@
-# Urban Flood Intelligence — Phase 0, 1, 2 (Data Collection & Preprocessing)
+# AquaShield application — presentation copy
 
-Ye tera part hai: Rainfall + Elevation data collect karna aur clean karke
-ek merged dataset banana jo baaki team Phase 3 (ML model) mein use karegi.
+Urban flood intelligence demo for **Vasai–Virar–Nalasopara (VVN)**. This copy includes the Streamlit app, processed datasets, saved ML models, and project notes.
 
-## Kaunsa platform use kare (jo bina "jyada IDE knowledge" ke kaam kare)
+## What to say tomorrow (simple)
 
-**Best option tere liye: Google Colab**
-- Browser mein khulta hai, koi install nahi chahiye
-- https://colab.research.google.com par jaake "New Notebook"
-- Har script ka code copy-paste karke ek cell mein run kar sakta hai
-- `!pip install osmnx geopandas` jaise commands cell ke start mein `!` lagakar chalti hain
+AquaShield is a flood-intelligence **application** (not a static website). It shows rainfall and flood risk, a map, an ML model, safer roads, a simulated IoT water sensor, citizen photo/video reports, and public YouTube/Instagram clips as extra dummy/real media.
 
-Agar VS Code use karna hai to bhi chalega, bas Python (3.10+) install hona chahiye.
+| Layer | Honest label |
+|---|---|
+| Rainfall, elevation, roads | Source-derived files (Open-Meteo / OpenStreetMap); some derived grid values are approximations |
+| Flood High/Medium/Low labels | Rule-based proxy formula, not a surveyed flood map |
+| ML metrics | Measured hold-out scores on rule-generated labels; not proof of real-world flood prediction |
+| IoT page | **Simulation** until ESP32 + Firebase exist |
+| Community uploads | Four synthetic demo posts are labelled; new uploads are user-submitted and unverified |
+| YouTube Shorts | Saved catalog of public Shorts links (65 records at this snapshot); not a live feed; pins are approximate/unverified |
+| Instagram | Six manually written hashtag demo cards; no live Instagram feed and no Instagram video embeds |
 
-## Setup (VS Code / local machine ke liye)
+## Run on Windows
 
-```bash
-# 1. Project folder mein jao
-cd urban-flood-intelligence
+Easiest: double-click `start_aquashield.bat`. The first run creates a Python virtual environment and installs requirements; it needs internet and may take several minutes. If the browser does not open automatically, visit http://localhost:8501.
 
-# 2. Virtual environment banao (optional but recommended)
-python -m venv venv
-venv\Scripts\activate      # Windows
-source venv/bin/activate   # Mac/Linux
+Or open PowerShell in this folder and run:
 
-# 3. Packages install karo
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+streamlit run src/dashboard/app.py
 ```
 
-## Run karne ka order (yehi Phase 0 -> 1 -> 2 ka flow hai)
+Browser opens at http://localhost:8501
 
-```bash
-# Phase 1 - Data collection (teeno alag alag chalayenge)
-python src/data_pipeline/collect_rainfall.py
-python src/data_pipeline/collect_osm.py
-python src/data_pipeline/collect_dem.py
+Click the sidebar pages in this order for the viva:
 
-# Phase 2 - Cleaning & merging
-python src/data_pipeline/preprocess.py
-```
+1. Home Dashboard  
+2. Flood Risk Map (tick the YouTube/Instagram pins)  
+3. Analytics  
+4. ML Model (show spatial Macro-F1, not accuracy)  
+5. Road Risk Map  
+6. Safe Routes (pick two different places)  
+7. IoT Sensor Monitoring (say “simulated”)  
+8. Community Reports (upload a phone photo)  
+9. Social Videos (play a Short)
 
-Har script apna data `data/raw/` folder mein save karega, aur final
-merged file `data/processed/merged_dataset.csv` mein aayegi — yehi file
-tumhare teammate ko doge jo Phase 3 (model training) kar raha hai.
+## Public web deployment (GitHub + Streamlit Community Cloud)
 
-## config.yaml zaroor check kar
+1. Create a GitHub repository. A **private** repository keeps the source code private; the deployed app can separately be made public.
+2. In VS Code, open this project root. If Source Control says there is no repository, choose **Initialize Repository**. Stage the project files, enter a commit message, and commit. Then choose **Publish to GitHub** and make the repository private. The `models/*.joblib` files are included because the prediction page needs them. The larger model is under GitHub's 100 MB per-file limit; do not upload it or the ZIP through GitHub's browser file uploader.
+3. Sign in at https://share.streamlit.io with GitHub. If the repository is private, authorize Community Cloud to access your private repositories, then choose **Create app**.
+4. Select the repository, its active branch (often `main` or `master`), and entrypoint `src/dashboard/app.py`, then deploy. Streamlit installs dependencies from `requirements.txt` in its own environment.
+5. In App settings → Sharing, set **Who can view this app** to public, then share the `*.streamlit.app` URL. Anyone with the URL can use it; no local Python setup is needed.
+6. Optional moderation: configure a strong `moderator_password = "..."` value in App settings → Secrets. Without it, report verification controls stay locked. Never commit secrets to GitHub.
 
-Ye file sab settings ka control panel hai — city ka naam, area (bounding box),
-date range, risk thresholds. Agar Mumbai ke alawa koi aur city use karni hai
-to bas ye file edit karni hai, code nahi.
+This is a student demo, not an operational flood-warning service. Public users can submit unverified community reports. The sample app stores reports/uploads locally; cloud restarts may clear them. Do not collect sensitive information or rely on this storage for a real service.
 
-## Apne dosto ke sath kaise share karein (GitHub)
+## Guide checklist
 
-1. https://github.com par jaake free account banao (agar nahi hai)
-2. Ek naya **Private Repository** banao, naam do: `urban-flood-intelligence`
-3. Apne local folder mein ye commands chalao:
-   ```bash
-   git init
-   git add .
-   git commit -m "Phase 0-2: data collection and preprocessing"
-   git remote add origin https://github.com/<your-username>/urban-flood-intelligence.git
-   git push -u origin main
-   ```
-4. GitHub repo settings mein jaake teammates ko **Collaborator** add kar do
-   (Settings -> Collaborators -> unka GitHub username daalo)
-5. Wo log `git clone <repo-link>` karke apne system pe poora code le sakte hain
+- Route indication → Safe Routes  
+- Application instead of website → Streamlit app chrome, phone-friendly layout  
+- IoT planning → labelled simulator  
+- UI/UX → maps, charts, risk chips  
+- Photo/video → Community Reports  
+- Dummy data from IG / social → Social Videos + Facebook-style demo posts  
 
-**Simple alternative (agar Git seekhne ka time nahi hai):** Poora
-`urban-flood-intelligence` folder ko ZIP karo aur Google Drive/WhatsApp
-pe share kar do. Kaam ho jayega lekin GitHub better hai kyunki sabka kaam
-ek jagah update hota rehta hai bina overwrite hue.
-
-## Important notes
-
-- `data/raw/` aur `data/processed/` folders bade ho sakte hain — GitHub
-  pe push karne se pehle ek `.gitignore` file bana lena jisme `data/` likh do,
-  taaki sirf code push ho, heavy data files nahi.
-- Rainfall data Open-Meteo se aa raha hai (free, no key). IMD ka data agar
-  professor specifically maangte hain to unka open data portal alag se
-  check karna padega — ye ek reliable substitute hai jab tak.
-- `collect_osm.py` chalane mein 1-2 minute lag sakta hai bade city ke liye,
-  ye normal hai, internet pe depend karta hai.

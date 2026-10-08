@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AquaShield - Flood Shorts Tester</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; max-width: 760px; margin-inline: auto; line-height: 1.4; }
+  h1 { font-size: 1.3rem; }
+  input, button { font-size: 1rem; padding: 10px; margin: 4px 0; width: 100%; box-sizing: border-box; }
+  button { cursor: pointer; }
+  #status { margin: 10px 0; color: #555; }
+  .card { border: 1px solid #ccc; border-radius: 10px; padding: 10px; margin: 10px 0; display: flex; gap: 10px; }
+  .card img { width: 120px; height: 90px; object-fit: cover; border-radius: 6px; }
+  .card a { font-weight: 600; text-decoration: none; }
+  .meta { font-size: .85rem; color: #666; }
+</style>
+</head>
+<body>
+<h1>AquaShield: Flood Shorts Tester</h1>
+
+<label>1. Paste your YouTube API key (stays in your browser only)</label>
+<input id="key" type="password" placeholder="AIza...">
+
+<label>2. Search</label>
+<input id="q" value="Vasai Virar flood">
+
+<label>3. Max length in seconds (Shorts = 60)</label>
+<input id="maxsec" type="number" value="60">
+
+<button onclick="run()">Fetch flood videos</button>
+<button onclick="download()" id="dl" style="display:none">Download flood_reports.json</button>
+
+<div id="status"></div>
+<div id="results"></div>
+
+<script>
+let reports = [];
+
+function parseDur(iso) {
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || "");
+  if (!m) return 0;
+  return (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0);
+}
+
+async function run() {
+  const key = document.getElementById("key").value.trim();
+  const q = document.getElementById("q").value.trim();
+  const maxsec = +document.getElementById("maxsec").value || 60;
+  const status = document.getElementById("status");
+  const out = document.getElementById("results");
+  out.innerHTML = ""; reports = [];
+  if (!key) { status.textContent = "Paste your API key first."; return; }
+  status.textContent = "Searching...";
+
+  try {
+    const sUrl = "https://www.googleapis.com/youtube/v3/search?part=id&type=video&videoDuration=short&regionCode=IN&order=date&maxResults=50"
+      + "&publishedAfter=2025-01-01T00:00:00Z&q=" + encodeURIComponent(q) + "&key=" + key;
+    const s = await (await fetch(sUrl)).json();
+    if (s.error) throw new Error(s.error.message);
+    const ids = (s.items || []).map(i => i.id.videoId);
+    if (!ids.length) { status.textContent = "No results."; return; }
+
+    const vUrl = "https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,statistics&id="
+      + ids.join(",") + "&key=" + key;
+    const v = await (await fetch(vUrl)).json();
+    if (v.error) throw new Error(v.error.message);
+
+    for (const item of v.items) {
+      const sec = parseDur(item.contentDetails.duration);
+      if (sec === 0 || sec > maxsec) continue;
+      const sn = item.snippet;
+      reports.push({
+        id: "yt_" + item.id, platform: "youtube", video_id: item.id,
+        title: sn.title, channel: sn.channelTitle, published_at: sn.publishedAt,
+        duration_sec: sec, views: +(item.statistics.viewCount || 0),
+        location: "Vasai-Virar", lat: 19.42, lng: 72.82, severity: "medium",
+        source_url: "https://www.youtube.com/shorts/" + item.id,
+        embed_url: "https://www.youtube.com/embed/" + item.id
+      });
+    }
+
+    status.textContent = "Found " + reports.length + " videos (of " + ids.length + " searched).";
+    document.getElementById("dl").style.display = reports.length ? "block" : "none";
+    out.innerHTML = reports.map(r => `
+      <div class="card">
+        <img src="https://i.ytimg.com/vi/${r.video_id}/hqdefault.jpg" alt="">
+        <div>
+          <a href="${r.source_url}" target="_blank" rel="noopener">${r.title.replace(/</g, "&lt;")}</a>
+          <div class="meta">${r.channel} · ${r.duration_sec}s · ${r.views.toLocaleString()} views · ${r.published_at.slice(0,10)}</div>
+        </div>
+      </div>`).join("");
+  } catch (e) {
+    status.textContent = "Error: " + e.message;
+  }
+}
+
+function download() {
+  const blob = new Blob([JSON.stringify(reports, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "flood_reports.json";
+  a.click();
+}
+</script>
+</body>
+</html>
